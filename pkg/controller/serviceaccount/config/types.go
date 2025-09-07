@@ -31,6 +31,10 @@ type SAControllerConfiguration struct {
 	// rootCAFile is the root certificate authority will be included in service
 	// account's token secret. This must be a valid PEM-encoded CA bundle.
 	RootCAFile string
+	// intermediateCertFile is the filename containing a PEM-encoded certificate chain
+	// to include in the x5c header of service account JWTs. The first certificate must
+	// correspond to the private key in ServiceAccountKeyFile.
+	IntermediateCertFile string
 }
 
 type LegacySATokenCleanerConfiguration struct {

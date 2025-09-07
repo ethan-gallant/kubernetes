@@ -18,18 +18,26 @@ package serviceaccount_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	jose "gopkg.in/go-jose/go-jose.v2"
+	"gopkg.in/go-jose/go-jose.v2/jwt"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
+	apiserverserviceaccount "k8s.io/apiserver/pkg/authentication/serviceaccount"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	typedv1core "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -615,4 +623,344 @@ func TestStaticPublicKeysGetter(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestJWTWithX5CHeader tests JWT token generation and validation with x5c certificate chain headers
+func TestJWTWithX5CHeader(t *testing.T) {
+	// Setup: Generate certificate chain for testing
+	rootKey, rootCert := generateTestCert(t, "Test Root CA", nil, nil, true, 1)
+	intermediateKey, intermediateCert := generateTestCert(t, "Test Intermediate CA", rootCert, rootKey, true, 2)
+	leafKey, leafCert := generateTestCert(t, "Test JWT Signer", intermediateCert, intermediateKey, false, 3)
+
+	certChain := []*x509.Certificate{leafCert, intermediateCert, rootCert}
+
+	// Generate token with x5c header
+	issuer := "test-issuer"
+	generator, err := serviceaccount.JWTTokenGeneratorWithCertChain(issuer, leafKey, certChain)
+	if err != nil {
+		t.Fatalf("Failed to create token generator with cert chain: %v", err)
+	}
+
+	claims := &jwt.Claims{
+		Subject:   "system:serviceaccount:default:test",
+		Audience:  jwt.Audience{"api"},
+		IssuedAt:  jwt.NewNumericDate(time.Now()),
+		NotBefore: jwt.NewNumericDate(time.Now()),
+		Expiry:    jwt.NewNumericDate(time.Now().Add(time.Hour)),
+	}
+
+	tokenWithX5C, err := generator.GenerateToken(context.Background(), claims, struct{}{})
+	if err != nil {
+		t.Fatalf("Failed to generate token: %v", err)
+	}
+
+	// Setup validator and keys getter
+	validator := &testValidatorX5C{}
+	keysGetter, err := serviceaccount.StaticPublicKeysGetter([]interface{}{&leafKey.PublicKey})
+	if err != nil {
+		t.Fatalf("Failed to create keys getter: %v", err)
+	}
+
+	rootCAPool := x509.NewCertPool()
+	rootCAPool.AddCert(rootCert)
+
+	wrongRootKey, wrongRootCert := generateTestCert(t, "Wrong Root CA", nil, nil, true, 999)
+	_ = wrongRootKey // unused
+	wrongRootCAPool := x509.NewCertPool()
+	wrongRootCAPool.AddCert(wrongRootCert)
+
+	testCases := map[string]struct {
+		Token        string
+		RootCAs      *x509.CertPool
+		Keys         []interface{}
+		ExpectedOK   bool
+		ExpectedUser string
+		ValidateX5C  bool // Whether x5c should be in the token
+	}{
+		"valid x5c chain with correct root CA": {
+			Token:        tokenWithX5C,
+			RootCAs:      rootCAPool,
+			Keys:         []interface{}{&leafKey.PublicKey},
+			ExpectedOK:   true,
+			ExpectedUser: "system:serviceaccount:default:test",
+			ValidateX5C:  true,
+		},
+		"valid x5c chain without CA validation (backward compatibility)": {
+			Token:        tokenWithX5C,
+			RootCAs:      nil, // No CA validation
+			Keys:         []interface{}{&leafKey.PublicKey},
+			ExpectedOK:   true,
+			ExpectedUser: "system:serviceaccount:default:test",
+			ValidateX5C:  true,
+		},
+		"x5c chain with wrong root CA falls back to key validation": {
+			Token:        tokenWithX5C,
+			RootCAs:      wrongRootCAPool,
+			Keys:         []interface{}{&leafKey.PublicKey},
+			ExpectedOK:   true, // Still works via key validation fallback
+			ExpectedUser: "system:serviceaccount:default:test",
+			ValidateX5C:  true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			// Validate x5c header presence if required
+			if tc.ValidateX5C {
+				if !hasX5CHeader(t, tc.Token, len(certChain)) {
+					t.Fatal("Token missing required x5c header")
+				}
+			}
+
+			// Create authenticator
+			var auth authenticator.Token
+			if tc.RootCAs != nil {
+				auth = serviceaccount.JWTTokenAuthenticatorWithCertChainValidation(
+					[]string{issuer},
+					keysGetter,
+					tc.RootCAs,
+					authenticator.Audiences{"api"},
+					validator,
+				)
+			} else {
+				auth = serviceaccount.JWTTokenAuthenticator(
+					[]string{issuer},
+					keysGetter,
+					authenticator.Audiences{"api"},
+					validator,
+				)
+			}
+
+			// Authenticate token
+			response, authenticated, err := auth.AuthenticateToken(context.Background(), tc.Token)
+
+			if tc.ExpectedOK {
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if !authenticated {
+					t.Fatal("Expected authentication to succeed")
+				}
+				if response == nil || response.User == nil {
+					t.Fatal("Response or user is nil")
+				}
+				if response.User.GetName() != tc.ExpectedUser {
+					t.Fatalf("Expected user %s, got %s", tc.ExpectedUser, response.User.GetName())
+				}
+			} else {
+				if authenticated {
+					t.Fatal("Expected authentication to fail")
+				}
+			}
+		})
+	}
+}
+
+// TestX5CHeaderCertificateChainOrdering tests that x5c headers follow RFC-7515 ordering requirements
+func TestX5CHeaderCertificateChainOrdering(t *testing.T) {
+	testCases := map[string]struct {
+		CertChainLength int
+		ExpectedOrder   bool // Whether we expect correct ordering
+	}{
+		"single certificate": {
+			CertChainLength: 1,
+			ExpectedOrder:   true,
+		},
+		"three certificate chain": {
+			CertChainLength: 3,
+			ExpectedOrder:   true,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			// Generate certificate chain
+			var certChain []*x509.Certificate
+			var leafKey *rsa.PrivateKey
+
+			if tc.CertChainLength == 1 {
+				key, cert := generateTestCert(t, "Test Signer", nil, nil, false, 1)
+				leafKey = key
+				certChain = []*x509.Certificate{cert}
+			} else {
+				rootKey, rootCert := generateTestCert(t, "Root CA", nil, nil, true, 1)
+				intermediateKey, intermediateCert := generateTestCert(t, "Intermediate CA", rootCert, rootKey, true, 2)
+				key, leafCert := generateTestCert(t, "Leaf Signer", intermediateCert, intermediateKey, false, 3)
+				leafKey = key
+				certChain = []*x509.Certificate{leafCert, intermediateCert, rootCert}
+			}
+
+			// Generate token with x5c
+			generator, err := serviceaccount.JWTTokenGeneratorWithCertChain("test-issuer", leafKey, certChain)
+			if err != nil {
+				t.Fatalf("Failed to create generator: %v", err)
+			}
+
+			claims := &jwt.Claims{
+				Subject:  "test",
+				Audience: jwt.Audience{"api"},
+				Expiry:   jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			}
+
+			token, err := generator.GenerateToken(context.Background(), claims, struct{}{})
+			if err != nil {
+				t.Fatalf("Failed to generate token: %v", err)
+			}
+
+			// Verify x5c header ordering
+			x5cCerts := extractX5CCerts(t, token)
+			if len(x5cCerts) != tc.CertChainLength {
+				t.Fatalf("Expected %d certificates in x5c, got %d", tc.CertChainLength, len(x5cCerts))
+			}
+
+			// Verify first certificate matches the signing certificate
+			if !x5cCerts[0].Equal(certChain[0]) {
+				t.Fatal("First certificate in x5c does not match signing certificate (RFC-7515 violation)")
+			}
+		})
+	}
+}
+
+func generateTestCert(
+	t *testing.T,
+	org string,
+	parent *x509.Certificate,
+	parentKey *rsa.PrivateKey,
+	isCA bool,
+	serial int64,
+) (*rsa.PrivateKey, *x509.Certificate) {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(serial),
+		Subject:               pkix.Name{Organization: []string{org}},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  isCA,
+	}
+
+	if isCA {
+		template.KeyUsage |= x509.KeyUsageCertSign
+	}
+
+	if parent == nil {
+		parent = &template
+		parentKey = key
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatalf("Failed to create certificate: %v", err)
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		t.Fatalf("Failed to parse certificate: %v", err)
+	}
+
+	return key, cert
+}
+
+func hasX5CHeader(t *testing.T, token string, expectedCertCount int) bool {
+	t.Helper()
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+
+	var headers map[string]interface{}
+	if err := json.Unmarshal(headerBytes, &headers); err != nil {
+		return false
+	}
+
+	x5cRaw, ok := headers["x5c"]
+	if !ok {
+		return false
+	}
+
+	x5cArray, ok := x5cRaw.([]interface{})
+	if !ok {
+		return false
+	}
+
+	return len(x5cArray) == expectedCertCount
+}
+
+func extractX5CCerts(t *testing.T, token string) []*x509.Certificate {
+	t.Helper()
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatal("Invalid JWT format")
+	}
+
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatalf("Failed to decode header: %v", err)
+	}
+
+	var headers map[string]interface{}
+	if err := json.Unmarshal(headerBytes, &headers); err != nil {
+		t.Fatalf("Failed to unmarshal header: %v", err)
+	}
+
+	x5cRaw, ok := headers["x5c"]
+	if !ok {
+		t.Fatal("Missing x5c header")
+	}
+
+	x5cArray, ok := x5cRaw.([]interface{})
+	if !ok {
+		t.Fatalf("x5c is not an array: %T", x5cRaw)
+	}
+
+	var certs []*x509.Certificate
+	for i, certB64 := range x5cArray {
+		certStr, ok := certB64.(string)
+		if !ok {
+			t.Fatalf("x5c[%d] is not a string", i)
+		}
+
+		certDER, err := base64.StdEncoding.DecodeString(certStr)
+		if err != nil {
+			t.Fatalf("Failed to decode x5c[%d]: %v", i, err)
+		}
+
+		cert, err := x509.ParseCertificate(certDER)
+		if err != nil {
+			t.Fatalf("Failed to parse x5c[%d]: %v", i, err)
+		}
+
+		certs = append(certs, cert)
+	}
+
+	return certs
+}
+
+type testValidatorX5C struct{}
+
+func (v *testValidatorX5C) Validate(
+	_ context.Context,
+	_ string,
+	_ *jwt.Claims,
+	_ *struct{},
+) (*apiserverserviceaccount.ServiceAccountInfo, error) {
+	return &apiserverserviceaccount.ServiceAccountInfo{
+		Namespace: "default",
+		Name:      "test",
+		UID:       "test-uid",
+	}, nil
 }

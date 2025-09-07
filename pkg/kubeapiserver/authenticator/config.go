@@ -18,6 +18,7 @@ package authenticator
 
 import (
 	"context"
+	cryptox509 "crypto/x509"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -44,6 +45,7 @@ import (
 	webhookutil "k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/oidc"
 	"k8s.io/apiserver/plugin/pkg/authenticator/token/webhook"
+	"k8s.io/client-go/util/cert"
 	typedv1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/kube-openapi/pkg/spec3"
 	"k8s.io/kube-openapi/pkg/validation/spec"
@@ -83,6 +85,8 @@ type Config struct {
 
 	// ServiceAccountPublicKeysGetter returns public keys for verifying service account tokens.
 	ServiceAccountPublicKeysGetter serviceaccount.PublicKeysGetter
+	// ServiceAccountIntermediateCAFile contains path to a CA certificate bundle for validating x5c chains.
+	ServiceAccountIntermediateCAFile string
 	// ServiceAccountTokenGetter fetches API objects used to verify bound objects in service account token claims.
 	ServiceAccountTokenGetter   serviceaccount.ServiceAccountTokenGetter
 	SecretsWriter               typedv1core.SecretsGetter
@@ -134,15 +138,28 @@ func (config Config) New(serverLifecycle context.Context) (authenticator.Request
 		}
 		tokenAuthenticators = append(tokenAuthenticators, authenticator.WrapAudienceAgnosticToken(config.APIAudiences, tokenAuth))
 	}
+	// Load intermediate CA certificate pool if provided
+	var rootCAs *cryptox509.CertPool
+	if config.ServiceAccountIntermediateCAFile != "" {
+		certs, err := cert.CertsFromFile(config.ServiceAccountIntermediateCAFile)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("failed to load intermediate CA certificates: %w", err)
+		}
+		rootCAs = cryptox509.NewCertPool()
+		for _, cert := range certs {
+			rootCAs.AddCert(cert)
+		}
+	}
+
 	if config.ServiceAccountPublicKeysGetter != nil {
-		serviceAccountAuth, err := newLegacyServiceAccountAuthenticator(config.ServiceAccountPublicKeysGetter, config.ServiceAccountLookup, config.APIAudiences, config.ServiceAccountTokenGetter, config.SecretsWriter)
+		serviceAccountAuth, err := newLegacyServiceAccountAuthenticator(config.ServiceAccountPublicKeysGetter, config.ServiceAccountLookup, config.APIAudiences, config.ServiceAccountTokenGetter, config.SecretsWriter, rootCAs)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
 		tokenAuthenticators = append(tokenAuthenticators, serviceAccountAuth)
 	}
 	if len(config.ServiceAccountIssuers) > 0 && config.ServiceAccountPublicKeysGetter != nil {
-		serviceAccountAuth, err := newServiceAccountAuthenticator(config.ServiceAccountIssuers, config.ServiceAccountPublicKeysGetter, config.APIAudiences, config.ServiceAccountTokenGetter)
+		serviceAccountAuth, err := newServiceAccountAuthenticator(config.ServiceAccountIssuers, config.ServiceAccountPublicKeysGetter, config.APIAudiences, config.ServiceAccountTokenGetter, rootCAs)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -340,7 +357,7 @@ func newAuthenticatorFromTokenFile(tokenAuthFile string) (authenticator.Token, e
 }
 
 // newLegacyServiceAccountAuthenticator returns an authenticator.Token or an error
-func newLegacyServiceAccountAuthenticator(publicKeysGetter serviceaccount.PublicKeysGetter, lookup bool, apiAudiences authenticator.Audiences, serviceAccountGetter serviceaccount.ServiceAccountTokenGetter, secretsWriter typedv1core.SecretsGetter) (authenticator.Token, error) {
+func newLegacyServiceAccountAuthenticator(publicKeysGetter serviceaccount.PublicKeysGetter, lookup bool, apiAudiences authenticator.Audiences, serviceAccountGetter serviceaccount.ServiceAccountTokenGetter, secretsWriter typedv1core.SecretsGetter, rootCAs *cryptox509.CertPool) (authenticator.Token, error) {
 	if publicKeysGetter == nil {
 		return nil, fmt.Errorf("no public key getter provided")
 	}
@@ -349,16 +366,16 @@ func newLegacyServiceAccountAuthenticator(publicKeysGetter serviceaccount.Public
 		return nil, fmt.Errorf("while creating legacy validator, err: %w", err)
 	}
 
-	tokenAuthenticator := serviceaccount.JWTTokenAuthenticator([]string{serviceaccount.LegacyIssuer}, publicKeysGetter, apiAudiences, validator)
+	tokenAuthenticator := serviceaccount.JWTTokenAuthenticatorWithCertChainValidation([]string{serviceaccount.LegacyIssuer}, publicKeysGetter, rootCAs, apiAudiences, validator)
 	return tokenAuthenticator, nil
 }
 
 // newServiceAccountAuthenticator returns an authenticator.Token or an error
-func newServiceAccountAuthenticator(issuers []string, publicKeysGetter serviceaccount.PublicKeysGetter, apiAudiences authenticator.Audiences, serviceAccountGetter serviceaccount.ServiceAccountTokenGetter) (authenticator.Token, error) {
+func newServiceAccountAuthenticator(issuers []string, publicKeysGetter serviceaccount.PublicKeysGetter, apiAudiences authenticator.Audiences, serviceAccountGetter serviceaccount.ServiceAccountTokenGetter, rootCAs *cryptox509.CertPool) (authenticator.Token, error) {
 	if publicKeysGetter == nil {
 		return nil, fmt.Errorf("no public key getter provided")
 	}
-	tokenAuthenticator := serviceaccount.JWTTokenAuthenticator(issuers, publicKeysGetter, apiAudiences, serviceaccount.NewValidator(serviceAccountGetter))
+	tokenAuthenticator := serviceaccount.JWTTokenAuthenticatorWithCertChainValidation(issuers, publicKeysGetter, rootCAs, apiAudiences, serviceaccount.NewValidator(serviceAccountGetter))
 	return tokenAuthenticator, nil
 }
 
