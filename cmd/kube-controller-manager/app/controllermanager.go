@@ -21,6 +21,7 @@ package app
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -813,7 +814,23 @@ func startServiceAccountTokenController(ctx context.Context, controllerContext C
 		rootCA = rootClientBuilder.ConfigOrDie("tokens-controller").CAData
 	}
 
-	tokenGenerator, err := serviceaccount.JWTTokenGenerator(serviceaccount.LegacyIssuer, privateKey)
+	// Load certificate chain if provided
+	var certChain []*x509.Certificate
+	if controllerContext.ComponentConfig.SAController.IntermediateCertFile != "" {
+		certChainPEM, err := os.ReadFile(controllerContext.ComponentConfig.SAController.IntermediateCertFile)
+		if err != nil {
+			return nil, true, fmt.Errorf("error reading intermediate certificate file at %s: %v", controllerContext.ComponentConfig.SAController.IntermediateCertFile, err)
+		}
+		certChain, err = certutil.ParseCertsPEM(certChainPEM)
+		if err != nil {
+			return nil, true, fmt.Errorf("error parsing intermediate certificates: %v", err)
+		}
+		if len(certChain) == 0 {
+			return nil, true, fmt.Errorf("no certificates found in intermediate certificate file")
+		}
+	}
+
+	tokenGenerator, err := serviceaccount.JWTTokenGeneratorWithCertChain(serviceaccount.LegacyIssuer, privateKey, certChain)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to build token generator: %v", err)
 	}

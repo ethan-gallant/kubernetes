@@ -59,21 +59,45 @@ type TokenGenerator interface {
 // JWTTokenGenerator returns a TokenGenerator that generates signed JWT tokens, using the given privateKey.
 // privateKey is a PEM-encoded byte array of a private RSA key.
 func JWTTokenGenerator(iss string, privateKey interface{}) (TokenGenerator, error) {
+	return JWTTokenGeneratorWithCertChain(iss, privateKey, nil)
+}
+
+// JWTTokenGeneratorWithCertChain returns a TokenGenerator that generates signed JWT tokens with optional x5c certificate chain header.
+// privateKey is the private key used for signing, certChain is an optional certificate chain to include in the x5c header.
+// If certChain is provided, the first certificate must contain the public key corresponding to privateKey.
+func JWTTokenGeneratorWithCertChain(iss string, privateKey interface{}, certChain []*x509.Certificate) (TokenGenerator, error) {
 	var signer jose.Signer
 	var err error
+
+	// Create SignerOptions with x5c header if certificate chain is provided
+	var opts *jose.SignerOptions
+	if len(certChain) > 0 {
+		// Convert certificate chain to base64-encoded strings as per RFC-7515
+		var x5cChain []string
+		for _, cert := range certChain {
+			x5cChain = append(x5cChain, base64.StdEncoding.EncodeToString(cert.Raw))
+		}
+
+		opts = &jose.SignerOptions{
+			ExtraHeaders: map[jose.HeaderKey]interface{}{
+				"x5c": x5cChain,
+			},
+		}
+	}
+
 	switch pk := privateKey.(type) {
 	case *rsa.PrivateKey:
-		signer, err = signerFromRSAPrivateKey(pk)
+		signer, err = signerFromRSAPrivateKey(pk, opts)
 		if err != nil {
 			return nil, fmt.Errorf("could not generate signer for RSA keypair: %v", err)
 		}
 	case *ecdsa.PrivateKey:
-		signer, err = signerFromECDSAPrivateKey(pk)
+		signer, err = signerFromECDSAPrivateKey(pk, opts)
 		if err != nil {
 			return nil, fmt.Errorf("could not generate signer for ECDSA keypair: %v", err)
 		}
 	case jose.OpaqueSigner:
-		signer, err = signerFromOpaqueSigner(pk)
+		signer, err = signerFromOpaqueSigner(pk, opts)
 		if err != nil {
 			return nil, fmt.Errorf("could not generate signer for OpaqueSigner: %v", err)
 		}
@@ -111,7 +135,7 @@ func keyIDFromPublicKey(publicKey interface{}) (string, error) {
 	return keyID, nil
 }
 
-func signerFromRSAPrivateKey(keyPair *rsa.PrivateKey) (jose.Signer, error) {
+func signerFromRSAPrivateKey(keyPair *rsa.PrivateKey, opts *jose.SignerOptions) (jose.Signer, error) {
 	keyID, err := keyIDFromPublicKey(&keyPair.PublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to derive keyID: %v", err)
@@ -135,7 +159,7 @@ func signerFromRSAPrivateKey(keyPair *rsa.PrivateKey) (jose.Signer, error) {
 			Algorithm: jose.RS256,
 			Key:       privateJWK,
 		},
-		nil,
+		opts,
 	)
 
 	if err != nil {
@@ -145,7 +169,7 @@ func signerFromRSAPrivateKey(keyPair *rsa.PrivateKey) (jose.Signer, error) {
 	return signer, nil
 }
 
-func signerFromECDSAPrivateKey(keyPair *ecdsa.PrivateKey) (jose.Signer, error) {
+func signerFromECDSAPrivateKey(keyPair *ecdsa.PrivateKey, opts *jose.SignerOptions) (jose.Signer, error) {
 	var alg jose.SignatureAlgorithm
 
 	// IMPORTANT: If this function is updated to support additional algorithms,
@@ -181,7 +205,7 @@ func signerFromECDSAPrivateKey(keyPair *ecdsa.PrivateKey) (jose.Signer, error) {
 			Algorithm: alg,
 			Key:       privateJWK,
 		},
-		nil,
+		opts,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create signer: %v", err)
@@ -190,7 +214,7 @@ func signerFromECDSAPrivateKey(keyPair *ecdsa.PrivateKey) (jose.Signer, error) {
 	return signer, nil
 }
 
-func signerFromOpaqueSigner(opaqueSigner jose.OpaqueSigner) (jose.Signer, error) {
+func signerFromOpaqueSigner(opaqueSigner jose.OpaqueSigner, opts *jose.SignerOptions) (jose.Signer, error) {
 	alg := jose.SignatureAlgorithm(opaqueSigner.Public().Algorithm)
 
 	signer, err := jose.NewSigner(
@@ -203,7 +227,7 @@ func signerFromOpaqueSigner(opaqueSigner jose.OpaqueSigner) (jose.Signer, error)
 				Use:       "sig",
 			},
 		},
-		nil,
+		opts,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create signer: %v", err)
@@ -225,6 +249,18 @@ func (j *jwtTokenGenerator) GenerateToken(ctx context.Context, claims *jwt.Claim
 // Token signatures are verified using each of the given public keys until one works (allowing key rotation)
 // If lookup is true, the service account and secret referenced as claims inside the token are retrieved and verified with the provided ServiceAccountTokenGetter
 func JWTTokenAuthenticator[PrivateClaims any](issuers []string, publicKeysGetter PublicKeysGetter, implicitAuds authenticator.Audiences, validator Validator[PrivateClaims]) authenticator.Token {
+	return JWTTokenAuthenticatorWithCertChainValidation(issuers, publicKeysGetter, nil, implicitAuds, validator)
+}
+
+// JWTTokenAuthenticatorWithCertChainValidation authenticates tokens with optional x5c certificate chain validation
+// If rootCAs is provided, tokens with x5c headers will have their certificate chains validated against these roots
+func JWTTokenAuthenticatorWithCertChainValidation[PrivateClaims any](
+	issuers []string,
+	publicKeysGetter PublicKeysGetter,
+	rootCAs *x509.CertPool,
+	implicitAuds authenticator.Audiences,
+	validator Validator[PrivateClaims],
+) authenticator.Token {
 	issuersMap := make(map[string]bool)
 	for _, issuer := range issuers {
 		issuersMap[issuer] = true
@@ -232,6 +268,7 @@ func JWTTokenAuthenticator[PrivateClaims any](issuers []string, publicKeysGetter
 	return &jwtTokenAuthenticator[PrivateClaims]{
 		issuers:      issuersMap,
 		keysGetter:   publicKeysGetter,
+		rootCAs:      rootCAs,
 		implicitAuds: implicitAuds,
 		validator:    validator,
 	}
@@ -316,6 +353,7 @@ func (s staticPublicKeysGetter) GetPublicKeys(ctx context.Context, keyID string)
 type jwtTokenAuthenticator[PrivateClaims any] struct {
 	issuers      map[string]bool
 	keysGetter   PublicKeysGetter
+	rootCAs      *x509.CertPool // Optional root CAs for x5c certificate chain validation
 	validator    Validator[PrivateClaims]
 	implicitAuds authenticator.Audiences
 }
@@ -344,34 +382,68 @@ func (j *jwtTokenAuthenticator[PrivateClaims]) AuthenticateToken(ctx context.Con
 	public := &jwt.Claims{}
 	private := new(PrivateClaims)
 
-	// Pick the key that has the same key ID as `tok`, if one exists.
-	var kid string
-	for _, header := range tok.Headers {
-		if header.KeyID != "" {
-			kid = header.KeyID
+	var found bool
+	var errlist []error
+
+	// Check if token has x5c header and validate certificate chain if root CAs are configured
+	// JWTs can have multiple signatures, each with its own header containing x5c chains
+	if j.rootCAs != nil {
+		opts := x509.VerifyOptions{
+			Roots: j.rootCAs,
+		}
+
+		// Try each header's x5c chain until we find one that validates
+	X5CHEADER:
+		for _, header := range tok.Headers {
+			chains, err := header.Certificates(opts)
+			if err != nil {
+				continue // This header doesn't have a valid x5c chain, try the next one
+			}
+
+			// The Certificates() method returns multiple valid certificate chains
+			// Try to verify the JWT with each chain's leaf certificate
+			for _, chain := range chains {
+				if len(chain) == 0 {
+					continue
+				}
+				// The first certificate in each chain is always the leaf certificate
+				leafCert := chain[0]
+				if err := tok.Claims(leafCert.PublicKey, public, private); err == nil {
+					found = true
+					break X5CHEADER
+				}
+			}
+		}
+		// If x5c validation fails or is not present, fall back to regular key validation
+	}
+
+	// If not validated by x5c, try regular key validation
+	if !found {
+		// Pick the key that has the same key ID as `tok`, if one exists.
+		var kid string
+		for _, header := range tok.Headers {
+			if header.KeyID != "" {
+				kid = header.KeyID
+				break
+			}
+		}
+
+		keys := j.keysGetter.GetPublicKeys(ctx, kid)
+		if len(keys) == 0 {
+			return nil, false, fmt.Errorf("invalid signature, no keys found")
+		}
+		for _, key := range keys {
+			if err := tok.Claims(key.PublicKey, public, private); err != nil {
+				errlist = append(errlist, err)
+				continue
+			}
+			found = true
 			break
 		}
-	}
 
-	var (
-		found   bool
-		errlist []error
-	)
-	keys := j.keysGetter.GetPublicKeys(ctx, kid)
-	if len(keys) == 0 {
-		return nil, false, fmt.Errorf("invalid signature, no keys found")
-	}
-	for _, key := range keys {
-		if err := tok.Claims(key.PublicKey, public, private); err != nil {
-			errlist = append(errlist, err)
-			continue
+		if !found {
+			return nil, false, utilerrors.NewAggregate(errlist)
 		}
-		found = true
-		break
-	}
-
-	if !found {
-		return nil, false, utilerrors.NewAggregate(errlist)
 	}
 
 	// sanity check issuer since we parsed it out before signature validation

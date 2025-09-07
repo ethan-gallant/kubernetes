@@ -141,6 +141,10 @@ type ServiceAccountAuthenticationOptions struct {
 	// ExternalPublicKeysGetter gets set if `--service-account-signing-endpoint` is passed.
 	// ExternalPublicKeysGetter is mutually exclusive with KeyFiles.
 	ExternalPublicKeysGetter serviceaccount.PublicKeysGetter
+	// IntermediateCAFile is the path to a file containing PEM-encoded x509 certificate authority
+	// used to validate x5c certificate chains in service account JWTs. If unspecified,
+	// x5c header validation is disabled.
+	IntermediateCAFile string
 }
 
 // TokenFileAuthenticationOptions contains token file authentication options for API Server
@@ -442,6 +446,12 @@ func (o *BuiltInAuthenticationOptions) AddFlags(fs *pflag.FlagSet) {
 			"which helps safe transition from legacy token to bound service account token feature. "+
 			"If this flag is enabled, admission injected tokens would be extended up to 1 year to "+
 			"prevent unexpected failure during transition, ignoring value of service-account-max-token-expiration.")
+
+		fs.StringVar(&o.ServiceAccounts.IntermediateCAFile, "service-account-intermediate-ca-file", o.ServiceAccounts.IntermediateCAFile, ""+
+			"File containing PEM-encoded x509 certificate authority used to validate x5c certificate chains "+
+			"in service account JWTs. This enables support for intermediate certificate signing where each "+
+			"controller-manager can use its own intermediate CA cert without needing to share private keys. "+
+			"If unspecified, x5c header validation is disabled.")
 	}
 
 	if o.TokenFile != nil {
@@ -618,6 +628,7 @@ func (o *BuiltInAuthenticationOptions) ToAuthenticationConfig() (kubeauthenticat
 
 		ret.ServiceAccountIssuers = o.ServiceAccounts.Issuers
 		ret.ServiceAccountLookup = o.ServiceAccounts.Lookup
+		ret.ServiceAccountIntermediateCAFile = o.ServiceAccounts.IntermediateCAFile
 	}
 
 	if o.TokenFile != nil {
